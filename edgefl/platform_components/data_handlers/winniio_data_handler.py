@@ -25,6 +25,7 @@ from sklearn.metrics import r2_score
 from platform_components.lib.modules.local_model_update import LocalModelUpdate
 from platform_components.model_fusion_algorithms.FedAvg import FedAvg_aggregate
 
+from platform_components.lib.logger.error_handling.exceptions import EdgeFLConnectionError, EdgeFLValidationError
 from platform_components.lib.logger.logger_config import configure_logging
 logger = logging.getLogger(__name__)
 
@@ -86,12 +87,16 @@ class WinniioDataHandler():
         try:
             response = requests.get(url=QUERY_NODE_URL, headers=headers)
             response.raise_for_status()
-        except Exception as error:
-            logger.error(Exception(f"Failed to execute GET against {QUERY_NODE_URL} (Error: {error})"))
+        except requests.exceptions.RequestException as error:
+            logger.error(f"Failed to execute GET against {QUERY_NODE_URL} (Error: {error})")
+            raise EdgeFLConnectionError(f"Failed to execute GET against {QUERY_NODE_URL}", original_error=error, context={"query": query})
+        
         try:
             output = response.json()
-        except Exception as error:
-            output = error
+        except ValueError as error:
+            logger.error(f"Failed to parse JSON response: {error}")
+            raise EdgeFLValidationError("Invalid JSON response", original_error=error, context={"query": query})
+            
         return output
 
     def model_def(self):
