@@ -56,6 +56,10 @@ manual_pause_state = {}
 # Latched so an invalid DRIFT_HANDLING only warns once per process.
 _drift_handling_warning_logged = False
 
+# DFL: enforce per-round monotonic application of aggregated submodels
+_apply_agg_lock = threading.Lock()
+_applied_agg_round = {}
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -389,7 +393,7 @@ def _get_highest_submodel_round(index) -> int:
         if response.status_code != 200:
             return 0
         body = response.content.decode("utf-8").strip()
-        return int(body) if body else 0
+        return int(body) if body.isdigit() else 0
     except Exception as e:
         logger.error(f"[{index}] Error fetching highest submodel round: {str(e)}")
         return 0
@@ -441,7 +445,7 @@ def _count_submodels_at_round(index, round_number) -> int:
         if response.status_code != 200:
             return 0
         body = response.content.decode("utf-8").strip()
-        return int(body) if body else 0
+        return int(body) if body.isdigit() else 0
     except Exception as e:
         logger.error(
             f"[{index}] Error counting submodels at round {round_number}: {str(e)}"
@@ -650,7 +654,9 @@ def dfl_aggregate_round(nodeInstance, round_number, index):
     local model, and publish RoundStart for the next round."""
     min_params = nodeInstance.minParams.get(index, 1)
     decoded_params = {}
-    check_chances = 5
+    PATIENCE_CYCLES = int(os.getenv("AGG_QUIET_CYCLES", "10"))
+    stalled_cycles = 0
+    published_seen = 0
 
     logger.info(
         f"[{index}][Round {round_number}] DFL: Waiting for {min_params} peer submodels"
@@ -658,6 +664,7 @@ def dfl_aggregate_round(nodeInstance, round_number, index):
 
     while True:
         try:
+            fetched_before = len(decoded_params)
             headers = {
                 "User-Agent": "AnyLog/1.23",
                 "command": f"blockchain get {index} where round_number={round_number} and node_type=training",
@@ -665,13 +672,14 @@ def dfl_aggregate_round(nodeInstance, round_number, index):
             response = requests.get(edgelake_node_url, headers=headers)
             response.raise_for_status()
 
-            result = response.json()
-            if result:
+            published = 0
+            if result := response.json():
                 node_params_links = [
                     item.get(index).get("trained_params_local_path")
                     for item in result
                     if index in item
                 ]
+                published = len(node_params_links)
                 ip_ports = [
                     item.get(index).get("ip_port") for item in result if index in item
                 ]
@@ -680,6 +688,7 @@ def dfl_aggregate_round(nodeInstance, round_number, index):
                     for item in result
                     if index in item
                 ]
+                published = len(node_params_links)
 
                 nodeInstance.fetch_decoded_params(
                     decoded_params_dict=decoded_params,
@@ -689,9 +698,32 @@ def dfl_aggregate_round(nodeInstance, round_number, index):
                     index=index,
                 )
 
-            if len(decoded_params) >= min_params or (
-                decoded_params and not check_chances
-            ):
+            made_progress = (
+                published > published_seen or len(decoded_params) > fetched_before
+            )
+            published_seen = max(published_seen, published)
+            if made_progress:
+                stalled_cycles = 0
+            else:
+                stalled_cycles += 1
+
+            fetched_all_available = len(decoded_params) == published
+            deadlock_fallback = (
+                bool(decoded_params)
+                and fetched_all_available
+                and stalled_cycles >= PATIENCE_CYCLES
+            )
+
+            have_enough_params = len(decoded_params) >= min_params
+            if have_enough_params or deadlock_fallback:
+                if not have_enough_params:
+                    logger.warning(
+                        f"[{index}][Round {round_number}] DFL: deadlock guard tripped; "
+                        f"aggregating {len(decoded_params)} submodel(s) below "
+                        f"min_params={min_params}; only {published} submodel(s) on-chain "
+                        f"after {stalled_cycles} quiet polls."
+                    )
+
                 # Aggregate
                 aggregated_params_link = nodeInstance.aggregate_model_params(
                     decoded_params=list(decoded_params.values()),
@@ -702,18 +734,28 @@ def dfl_aggregate_round(nodeInstance, round_number, index):
                     f"[{index}][Round {round_number}] DFL: Aggregated {len(decoded_params)} submodels"
                 )
 
-                # Update local model with aggregated weights
-                local_path = f"{nodeInstance.file_write_destination}/{index}/{round_number}-{nodeInstance.name}_update.json"
-                with open(local_path, "rb") as f:
-                    data = pickle.load(f)
+                with _apply_agg_lock:
+                    if round_number <= _applied_agg_round.get(index, 0):
+                        logger.info(
+                            f"[{index}][Round {round_number}] DFL: aggregation superseded "
+                            f"(round {_applied_agg_round[index]} already applied locally); "
+                            f"skipping stale model update and RoundStart."
+                        )
+                        return
 
-                if data and "newUpdates" in data:
-                    weights = nodeInstance.decode_params(data["newUpdates"])
-                else:
-                    logger.error(f"[{index}] Invalid aggregated data")
-                    return
+                    # Update local model with aggregated weights
+                    local_path = f"{nodeInstance.file_write_destination}/{index}/{round_number}-{nodeInstance.name}_update.json"
+                    with open(local_path, "rb") as f:
+                        data = pickle.load(f)
 
-                nodeInstance.data_handlers[index].update_model(weights)
+                    if data and "newUpdates" in data:
+                        weights = nodeInstance.decode_params(data["newUpdates"])
+                    else:
+                        logger.error(f"[{index}] Invalid aggregated data")
+                        return
+
+                    nodeInstance.data_handlers[index].update_model(weights)
+                    _applied_agg_round[index] = round_number
 
                 # Publish RoundStart for next round so peers can pick it up
                 next_round = round_number + 1
@@ -736,12 +778,6 @@ def dfl_aggregate_round(nodeInstance, round_number, index):
                     f"[{index}][Round {round_number}] DFL: Published RoundStart for round {next_round}"
                 )
                 return
-
-            if decoded_params and check_chances:
-                check_chances -= 1
-
-            if not decoded_params and not check_chances:
-                check_chances = 5
 
         except Exception as e:
             logger.error(
